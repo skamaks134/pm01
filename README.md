@@ -206,3 +206,242 @@ show ip ospf database  # База данных LSA
 
 Убедиться, что интерфейсы не в passive-interface.
 
+### **Полная настройка LACP и OSPF через FRRouting (FRR)**
+
+---
+
+## **1. Настройка LACP (Link Aggregation) между SW1 и SW2**
+
+### **Топология**
+- **SW1** (Ports: `eth1`, `eth2`) ↔ **SW2** (Ports: `eth1`, `eth2`)  
+- Агрегированный канал (`bond0`) с LACP в режиме `802.3ad`.
+
+---
+
+### **Настройка на SW1 (Debian/Ubuntu + FRR)**
+#### **1. Установка пакетов**
+```bash
+sudo apt update
+sudo apt install ifenslave frr
+```
+
+#### **2. Настройка агрегации (bonding)**
+```bash
+sudo nano /etc/network/interfaces
+```
+Добавляем:
+```bash
+# Bonding interface (LACP)
+auto bond0
+iface bond0 inet manual
+    bond-mode 802.3ad
+    bond-miimon 100
+    bond-lacp-rate 1
+    bond-slaves eth1 eth2
+    bond-xmit-hash-policy layer3+4
+
+# Физические интерфейсы
+auto eth1
+iface eth1 inet manual
+    bond-master bond0
+
+auto eth2
+iface eth2 inet manual
+    bond-master bond0
+```
+Применяем:
+```bash
+sudo systemctl restart networking
+```
+
+#### **3. Проверка агрегации**
+```bash
+cat /proc/net/bonding/bond0
+```
+Вывод должен содержать:
+```bash
+LACP rate: fast
+Aggregator selection policy (ad_select): stable
+Active Aggregator Info:
+    LACP state: Negotiation
+    Number of ports: 2
+```
+
+---
+
+### **Настройка на SW2 (аналогично SW1)**
+```bash
+sudo nano /etc/network/interfaces
+```
+```bash
+auto bond0
+iface bond0 inet manual
+    bond-mode 802.3ad
+    bond-miimon 100
+    bond-lacp-rate 1
+    bond-slaves eth1 eth2
+    bond-xmit-hash-policy layer3+4
+
+auto eth1
+iface eth1 inet manual
+    bond-master bond0
+
+auto eth2
+iface eth2 inet manual
+    bond-master bond0
+```
+```bash
+sudo systemctl restart networking
+```
+
+---
+
+## **2. Настройка OSPF между SW1, SW2, SW3**
+
+### **Топология**
+- **SW1** (`192.168.1.1`) ↔ **SW2** (`192.168.2.1`) ↔ **SW3** (`192.168.3.1`)  
+- **Сети:**
+  - `10.0.12.0/24` (SW1 ↔ SW2)  
+  - `10.0.23.0/24` (SW2 ↔ SW3)  
+  - `10.0.13.0/24` (SW1 ↔ SW3)  
+
+---
+
+### **Настройка FRR (OSPF) на SW1**
+#### **1. Включение OSPF в FRR**
+```bash
+sudo vtysh
+```
+```bash
+configure terminal
+router ospf
+    network 10.0.12.0/24 area 0
+    network 10.0.13.0/24 area 0
+    network 192.168.1.0/24 area 0
+    exit
+exit
+write
+```
+
+#### **2. Назначение IP-адресов**
+```bash
+sudo ip addr add 10.0.12.1/24 dev bond0
+sudo ip addr add 10.0.13.1/24 dev eth3  # Если есть третий интерфейс
+sudo ip addr add 192.168.1.1/24 dev eth0
+```
+
+---
+
+### **Настройка FRR (OSPF) на SW2**
+```bash
+sudo vtysh
+```
+```bash
+configure terminal
+router ospf
+    network 10.0.12.0/24 area 0
+    network 10.0.23.0/24 area 0
+    network 192.168.2.0/24 area 0
+    exit
+exit
+write
+```
+```bash
+sudo ip addr add 10.0.12.2/24 dev bond0
+sudo ip addr add 10.0.23.1/24 dev eth3
+sudo ip addr add 192.168.2.1/24 dev eth0
+```
+
+---
+
+### **Настройка FRR (OSPF) на SW3**
+```bash
+sudo vtysh
+```
+```bash
+configure terminal
+router ospf
+    network 10.0.13.0/24 area 0
+    network 10.0.23.0/24 area 0
+    network 192.168.3.0/24 area 0
+    exit
+exit
+write
+```
+```bash
+sudo ip addr add 10.0.13.2/24 dev bond0
+sudo ip addr add 10.0.23.2/24 dev eth3
+sudo ip addr add 192.168.3.1/24 dev eth0
+```
+
+---
+
+## **3. Проверка работы OSPF и LACP**
+
+### **Проверка OSPF-соседей**
+```bash
+sudo vtysh
+show ip ospf neighbor
+```
+Вывод должен быть примерно таким:
+```bash
+Neighbor ID     Pri   State      Dead Time   Address    Interface
+192.168.2.1     1    Full/DR    00:00:35    10.0.12.2  bond0
+192.168.3.1     1    Full/BDR   00:00:37    10.0.13.2  eth3
+```
+
+### **Проверка таблицы маршрутизации**
+```bash
+show ip route ospf
+```
+Пример вывода:
+```bash
+O 10.0.23.0/24 [110/10] via 10.0.12.2, bond0
+O 192.168.2.0/24 [110/20] via 10.0.12.2, bond0
+```
+
+### **Проверка LACP**
+```bash
+cat /proc/net/bonding/bond0
+```
+```bash
+LACP rate: fast
+Slave Interface: eth1
+    MII Status: up
+    Aggregator ID: 1
+Slave Interface: eth2
+    MII Status: up
+    Aggregator ID: 1
+```
+
+---
+
+## **4. Диагностика и устранение неполадок**
+
+### **Если OSPF не работает**
+1. **Проверить физическое соединение** (`ping 10.0.12.2`).
+2. **Убедиться, что OSPF включен**:
+   ```bash
+   sudo vtysh
+   show running-config
+   ```
+3. **Проверить `network` в OSPF** (должны быть правильные подсети).
+
+### **Если LACP не работает**
+1. **Проверить `bonding`-интерфейс**:
+   ```bash
+   ip link show bond0
+   ```
+2. **Убедиться, что оба порта `up`**:
+   ```bash
+   ethtool eth1 | grep "Link detected"
+   ```
+3. **Проверить настройки `bond-mode`** (должно быть `802.3ad`).
+
+---
+
+### **Итог**
+- **LACP** настроен через `bonding` в режиме `802.3ad`.  
+- **OSPF** работает через FRR, маршруты автоматически обновляются.  
+- Проверка через `vtysh` и `ip route`.  
+- Если что-то не работает — смотреть логи (`journalctl -u frr`).
